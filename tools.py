@@ -16,7 +16,7 @@ import logging
 import os
 import re
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -70,6 +70,51 @@ def read_bookings() -> str:
     return BOOKINGS_PATH.read_text() if BOOKINGS_PATH.exists() else ""
 
 
+def _calendar_url(
+    venue: str,
+    date: str | None,
+    time: str | None,
+    party_size: int | None,
+    notes: str | None,
+) -> str | None:
+    """Build a Google Calendar 'add event' URL for a reservation.
+    Returns None if date/time can't be parsed; caller skips the link in that case."""
+    if not date or not time:
+        return None
+    try:
+        d = datetime.strptime(date.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    t_norm = time.strip().lower().replace(" ", "")
+    start_time = None
+    for fmt in ("%I:%M%p", "%I%p", "%H:%M"):
+        try:
+            start_time = datetime.strptime(t_norm, fmt).time()
+            break
+        except ValueError:
+            continue
+    if start_time is None:
+        return None
+    start = datetime.combine(d, start_time)
+    end = start + timedelta(hours=2)
+    stamp_fmt = "%Y%m%dT%H%M%S"
+    details_parts = []
+    if party_size:
+        details_parts.append(f"Party of {party_size}")
+    if notes:
+        details_parts.append(notes.strip())
+    params = {
+        "action": "TEMPLATE",
+        "text": venue,
+        "dates": f"{start.strftime(stamp_fmt)}/{end.strftime(stamp_fmt)}",
+        "location": venue,
+        "ctz": os.environ.get("CALENDAR_TZ", "America/New_York"),
+    }
+    if details_parts:
+        params["details"] = " — ".join(details_parts)
+    return "https://calendar.google.com/calendar/render?" + urllib.parse.urlencode(params)
+
+
 def log_booking(
     venue: str,
     date: str | None = None,
@@ -94,7 +139,11 @@ def log_booking(
     line = " ".join(parts)
     with BOOKINGS_PATH.open("a") as f:
         f.write(f"\n- [{stamp}] {line}")
-    return f"booking saved: {line}"
+    result = f"booking saved: {line}"
+    cal_url = _calendar_url(venue, date, time, party_size, notes)
+    if cal_url:
+        result += f"\ncalendar_url: {cal_url}"
+    return result
 
 
 # ---------- beli ----------
@@ -504,7 +553,11 @@ TOOL_SCHEMAS = [
             "actually booked / are going to a place — phrases like 'booked the dutch', "
             "'going with raoul's', 'let's do balthazar at 8', 'reserved penny roma for "
             "tomorrow'. Capture date/time/party from context if available. Critical for "
-            "fuzzy-matching later when the user shares a rating without naming the spot."
+            "fuzzy-matching later when the user shares a rating without naming the spot. "
+            "When date is YYYY-MM-DD and time is concrete (e.g. '8:00pm'), the tool "
+            "returns a `calendar_url:` line — a Google Calendar 'add event' link. Pass "
+            "that URL through to the user verbatim in your reply so they can tap to save. "
+            "Prefer YYYY-MM-DD over 'Friday' here — resolve natural dates to ISO first."
         ),
         "input_schema": {
             "type": "object",
