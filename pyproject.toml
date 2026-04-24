@@ -1,0 +1,11 @@
+[project]
+name = "bookings"
+version = "0.1.0"
+description = "Telegram dinner-rez agent over Resy + OpenTable deep links"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "python-telegram-bot>=21.0",
+    "httpx>=0.27.0",
+    "python-dotenv>=1.0.0",
+]

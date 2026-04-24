@@ -1,0 +1,29 @@
+# secrets + personal config
+.env
+
+# user state (agent-mutated; templates provided as *.example.md)
+prefs.md
+beli.md
+bookings.md
+history.md
+
+# logs
+*.log
+
+# editor artifacts (vim)
+*.un~
+.*.un~
+*.swp
+*.swo
+*.swn
+*~
+Session.vim
+.netrwhist
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+
+# claude code
+.claude/settings.local.json
