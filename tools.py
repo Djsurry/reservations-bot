@@ -115,6 +115,147 @@ def _calendar_url(
     return "https://calendar.google.com/calendar/render?" + urllib.parse.urlencode(params)
 
 
+_BOOKING_RE = re.compile(
+    r"^- \[(?P<stamp>[^\]]+)\]\s+"
+    r"(?P<venue>[^—@(]+?)\s*"
+    r"(?:—\s+party of (?P<party>\d+))?\s*"
+    r"(?:@\s+(?P<when>[^(]+?))?\s*"
+    r"(?:\((?P<notes>.+)\))?\s*$"
+)
+
+
+def _parse_booking_line(line: str) -> dict | None:
+    m = _BOOKING_RE.match(line.strip())
+    if not m:
+        return None
+    d = m.groupdict()
+    when = (d.get("when") or "").strip()
+    date, time = None, None
+    if when:
+        parts = when.split(None, 1)
+        if parts and re.match(r"^\d{4}-\d{2}-\d{2}$", parts[0]):
+            date = parts[0]
+            time = parts[1].strip() if len(parts) > 1 else None
+        else:
+            time = when
+    return {
+        "stamp": d["stamp"],
+        "venue": d["venue"].strip(),
+        "party_size": int(d["party"]) if d.get("party") else None,
+        "date": date,
+        "time": time,
+        "notes": d.get("notes"),
+    }
+
+
+def _format_booking(
+    stamp: str,
+    venue: str,
+    date: str | None = None,
+    time: str | None = None,
+    party_size: int | None = None,
+    notes: str | None = None,
+) -> str:
+    parts = [venue]
+    if party_size:
+        parts.append(f"— party of {party_size}")
+    when_bits = [b for b in [date, time] if b]
+    if when_bits:
+        parts.append(f"@ {' '.join(when_bits)}")
+    if notes:
+        parts.append(f"({notes.strip()})")
+    return f"- [{stamp}] " + " ".join(parts)
+
+
+def _find_booking_indices(
+    lines: list[str], venue: str, date: str | None, time: str | None
+) -> list[int]:
+    venue_l = venue.lower()
+    time_norm = (time or "").lower().replace(" ", "")
+    out = []
+    for i, ln in enumerate(lines):
+        if not ln.strip().startswith("- ["):
+            continue
+        low = ln.lower()
+        if venue_l not in low:
+            continue
+        if date and date not in ln:
+            continue
+        if time_norm and time_norm not in low.replace(" ", ""):
+            continue
+        out.append(i)
+    return out
+
+
+def delete_booking(
+    venue: str,
+    date: str | None = None,
+    time: str | None = None,
+) -> str:
+    """Remove a booking entry from bookings.md. Edits the local log only —
+    does NOT cancel the real reservation on Resy/OpenTable."""
+    if not BOOKINGS_PATH.exists():
+        return "no bookings file"
+    text = BOOKINGS_PATH.read_text()
+    lines = text.splitlines()
+    idxs = _find_booking_indices(lines, venue, date, time)
+    if not idxs:
+        return f"no booking matched venue={venue!r} date={date!r} time={time!r}"
+    if len(idxs) > 1:
+        preview = "\n".join(lines[i] for i in idxs)
+        return (
+            f"ambiguous: {len(idxs)} bookings match; narrow with date/time.\n{preview}"
+        )
+    removed = lines.pop(idxs[0])
+    BOOKINGS_PATH.write_text(
+        "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+    )
+    return f"deleted: {removed}"
+
+
+def edit_booking(
+    venue: str,
+    date: str | None = None,
+    time: str | None = None,
+    new_venue: str | None = None,
+    new_date: str | None = None,
+    new_time: str | None = None,
+    new_party_size: int | None = None,
+    new_notes: str | None = None,
+) -> str:
+    """Modify a booking entry. Match fields identify the row; new_* fields
+    overwrite. Unspecified new_* fields carry over. Local log only — not Resy."""
+    if not BOOKINGS_PATH.exists():
+        return "no bookings file"
+    text = BOOKINGS_PATH.read_text()
+    lines = text.splitlines()
+    idxs = _find_booking_indices(lines, venue, date, time)
+    if not idxs:
+        return f"no booking matched venue={venue!r} date={date!r} time={time!r}"
+    if len(idxs) > 1:
+        preview = "\n".join(lines[i] for i in idxs)
+        return (
+            f"ambiguous: {len(idxs)} bookings match; narrow with date/time.\n{preview}"
+        )
+    idx = idxs[0]
+    parsed = _parse_booking_line(lines[idx])
+    if not parsed:
+        return f"failed to parse booking: {lines[idx]}"
+    updated = _format_booking(
+        stamp=parsed["stamp"],
+        venue=new_venue if new_venue is not None else parsed["venue"],
+        date=new_date if new_date is not None else parsed["date"],
+        time=new_time if new_time is not None else parsed["time"],
+        party_size=new_party_size if new_party_size is not None else parsed["party_size"],
+        notes=new_notes if new_notes is not None else parsed["notes"],
+    )
+    lines[idx] = updated
+    BOOKINGS_PATH.write_text(
+        "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+    )
+    return f"updated: {updated}"
+
+
 def log_booking(
     venue: str,
     date: str | None = None,
@@ -572,6 +713,53 @@ TOOL_SCHEMAS = [
         },
     },
     {
+        "name": "delete_booking",
+        "description": (
+            "Remove an entry from the local bookings log (bookings.md). Use when "
+            "the user says a booking was logged incorrectly, is a duplicate, or "
+            "they cancelled the reservation. Match by `venue` (required) plus "
+            "optional `date` (YYYY-MM-DD) and `time` — must uniquely identify one "
+            "row, otherwise the tool returns the ambiguous matches and you should "
+            "re-call with tighter filters. IMPORTANT: this only edits our local "
+            "log; it does NOT cancel the actual reservation on Resy/OpenTable. "
+            "If there's a live reservation, still hand the user the Resy/OT "
+            "booking link so they can cancel it there."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "venue": {"type": "string"},
+                "date": {"type": "string", "description": "YYYY-MM-DD"},
+                "time": {"type": "string", "description": "e.g. '8:15pm'"},
+            },
+            "required": ["venue"],
+        },
+    },
+    {
+        "name": "edit_booking",
+        "description": (
+            "Modify an entry in the local bookings log. Identify the row with "
+            "`venue` (required) + optional `date`/`time`; overwrite any `new_*` "
+            "fields. Fields you omit carry over. Must uniquely identify one row. "
+            "Local log only — for actual reservation changes the user must "
+            "rebook on Resy/OpenTable."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "venue": {"type": "string", "description": "Current venue to match on"},
+                "date": {"type": "string", "description": "Current date (YYYY-MM-DD), for disambiguation"},
+                "time": {"type": "string", "description": "Current time, for disambiguation"},
+                "new_venue": {"type": "string"},
+                "new_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "new_time": {"type": "string"},
+                "new_party_size": {"type": "integer"},
+                "new_notes": {"type": "string"},
+            },
+            "required": ["venue"],
+        },
+    },
+    {
         "name": "read_bookings",
         "description": (
             "Return the recent confirmed-bookings log. Use this when the user shares "
@@ -678,6 +866,23 @@ def dispatch(name: str, args: dict):
         )
     if name == "read_bookings":
         return read_bookings()
+    if name == "delete_booking":
+        return delete_booking(
+            venue=args["venue"],
+            date=args.get("date"),
+            time=args.get("time"),
+        )
+    if name == "edit_booking":
+        return edit_booking(
+            venue=args["venue"],
+            date=args.get("date"),
+            time=args.get("time"),
+            new_venue=args.get("new_venue"),
+            new_date=args.get("new_date"),
+            new_time=args.get("new_time"),
+            new_party_size=args.get("new_party_size"),
+            new_notes=args.get("new_notes"),
+        )
     if name == "read_beli":
         return read_beli()
     if name == "log_beli":
