@@ -758,7 +758,7 @@ TOOL_SCHEMAS = [
                 },
                 "destination": {
                     "type": "string",
-                    "description": "Address string or 'lat,lng' (use the venue's lat,lng from search_restaurants).",
+                    "description": "Address string or 'lat,lng'. Prefer 'lat,lng' from search_restaurants when you have it, but a free-text address like 'Black Tap, SoHo, NYC' works too — use that when the user names a venue you don't already have coords for.",
                 },
                 "mode": {
                     "type": "string",
