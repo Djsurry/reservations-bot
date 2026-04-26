@@ -2,6 +2,7 @@
 
 External APIs used:
 - Google Places (Text Search) for discovery
+- Google Routes (computeRoutes) for travel-time estimates
 - Resy /4/find for availability (unofficial; public web key)
 - OpenTable: deep-link only — their API is locked behind Akamai bot mgmt
   (HTML page hangs, all dapi probes 403/404). Real availability would need
@@ -16,8 +17,9 @@ import logging
 import os
 import re
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -341,6 +343,110 @@ def _parse_latlng(s: str) -> dict:
     return {"latitude": float(m.group(1)), "longitude": float(m.group(2))}
 
 
+# ---------- travel time: Google Routes ----------
+
+_LATLNG_RE = re.compile(r"^\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*$")
+
+_MODE_MAP = {
+    "transit": "TRANSIT",
+    "walking": "WALK",
+    "walk": "WALK",
+    "driving": "DRIVE",
+    "drive": "DRIVE",
+    "bicycling": "BICYCLE",
+    "bicycle": "BICYCLE",
+    "bike": "BICYCLE",
+}
+
+
+def _waypoint(s: str) -> dict:
+    """Routes API waypoint from either 'lat,lng' or a free-text address."""
+    m = _LATLNG_RE.match(s)
+    if m:
+        return {"location": {"latLng": {
+            "latitude": float(m.group(1)),
+            "longitude": float(m.group(2)),
+        }}}
+    return {"address": s}
+
+
+def travel_time(
+    origin: str,
+    destination: str,
+    mode: str = "transit",
+    date: str | None = None,
+    time_hhmm: str | None = None,
+) -> dict:
+    """Estimate travel time between two points via Google Routes API.
+
+    origin/destination: address string OR 'lat,lng'.
+    mode: transit | walking | driving | bicycling.
+    date (YYYY-MM-DD) + time_hhmm ('1930'): optional departure. Required for
+      traffic-aware driving. Past times are dropped (Routes rejects them for
+      transit) and the call falls back to 'depart now'.
+    """
+    key = _google_key()
+    if not key:
+        return {"error": "GOOGLE_PLACES_API_KEY not set"}
+
+    travel_mode = _MODE_MAP.get(mode.lower())
+    if not travel_mode:
+        return {"error": f"unknown mode: {mode!r}"}
+
+    body: dict = {
+        "origin": _waypoint(origin),
+        "destination": _waypoint(destination),
+        "travelMode": travel_mode,
+    }
+    if travel_mode == "DRIVE":
+        body["routingPreference"] = "TRAFFIC_AWARE"
+
+    if date and time_hhmm and len(time_hhmm) == 4 and time_hhmm.isdigit():
+        try:
+            tz = ZoneInfo(os.environ.get("CALENDAR_TZ", "America/New_York"))
+            d = datetime.strptime(date, "%Y-%m-%d").date()
+            hh, mm = int(time_hhmm[:2]), int(time_hhmm[2:])
+            dep = datetime(d.year, d.month, d.day, hh, mm, tzinfo=tz)
+            if dep > datetime.now(tz) + timedelta(minutes=1):
+                body["departureTime"] = (
+                    dep.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                )
+        except ValueError:
+            pass
+
+    url = "https://routes.googleapis.com/directions/v2:computeRoutes"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": key,
+        "X-Goog-FieldMask": "routes.duration,routes.distanceMeters",
+    }
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            r = client.post(url, headers=headers, json=body)
+    except httpx.RequestError as e:
+        return {"error": f"routes request failed: {e}"}
+
+    if r.status_code != 200:
+        return {"error": f"routes api {r.status_code}: {r.text[:200]}"}
+
+    routes = r.json().get("routes") or []
+    if not routes:
+        return {"error": "no route found", "mode": mode}
+
+    route = routes[0]
+    dur_str = route.get("duration", "")  # e.g. "1234s"
+    dur_sec = int(dur_str.rstrip("s")) if dur_str.endswith("s") else None
+    distance_m = route.get("distanceMeters")
+
+    return {
+        "mode": mode,
+        "duration_min": round(dur_sec / 60) if dur_sec is not None else None,
+        "distance_m": distance_m,
+        "distance_mi": round(distance_m / 1609.34, 1) if distance_m else None,
+    }
+
+
 # ---------- availability: Resy ----------
 
 def resy_find(
@@ -631,6 +737,41 @@ TOOL_SCHEMAS = [
         },
     },
     {
+        "name": "travel_time",
+        "description": (
+            "Estimate travel time between two points via Google Routes. Use this "
+            "whenever the user asks how long to get somewhere, whether a venue is "
+            "convenient, or to compare candidates by proximity. Never guess transit/"
+            "walk/drive times — call this tool. Default origin: the user's home "
+            "address from prefs (unless they name another start). Destination: pass "
+            "the venue's `lat,lng` from search_restaurants. Default mode: 'transit' "
+            "in NYC. Pass `date`+`time_hhmm` (the reservation time) for traffic-aware "
+            "driving estimates. Fan out modes in parallel (one call per mode) when "
+            "comparing options."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "origin": {
+                    "type": "string",
+                    "description": "Address string or 'lat,lng'. Use the home/work address from prefs unless the user gives another starting point.",
+                },
+                "destination": {
+                    "type": "string",
+                    "description": "Address string or 'lat,lng' (use the venue's lat,lng from search_restaurants).",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["transit", "walking", "driving", "bicycling"],
+                    "description": "Travel mode. Default 'transit' for NYC.",
+                },
+                "date": {"type": "string", "description": "YYYY-MM-DD departure date. Optional — defaults to now."},
+                "time_hhmm": {"type": "string", "description": "Departure time, 4 digits e.g. '1930'. Optional — pass the reservation time for traffic-aware driving."},
+            },
+            "required": ["origin", "destination"],
+        },
+    },
+    {
         "name": "check_availability",
         "description": (
             "Check Resy for real availability at a specific restaurant near a lat/lng. "
@@ -692,6 +833,14 @@ def dispatch(name: str, args: dict):
             location_bias=args.get("location_bias"),
             neighborhood=args.get("neighborhood"),
             max_results=args.get("max_results", 8),
+        )
+    if name == "travel_time":
+        return travel_time(
+            origin=args["origin"],
+            destination=args["destination"],
+            mode=args.get("mode", "transit"),
+            date=args.get("date"),
+            time_hhmm=args.get("time_hhmm"),
         )
     if name == "check_availability":
         return check_availability(
